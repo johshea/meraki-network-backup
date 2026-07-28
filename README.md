@@ -119,13 +119,3 @@ switch-only network, for example, produces just `Organization/`, `Network/`,
   around (or move them into whatever backup/versioning system you already
   use) for history.
 
-## Example: the "Vision" network
-
-For reference, running this against org **Ultron** (ID `1009754`), network
-**Vision** (ID `L_625437398251084430`) produces folders for
-SecurityAppliance (a C8355-G2 SD-WAN appliance), Switch (a C9350-48HX core
-+ an MS130-12X access switch), Wireless (CW9172I/CW9178I APs), Camera (MV93/
-MV63/MV32/MV13/MV23M models), Sensor (~20 MT10/12/14/15/20/40 environmental
-sensors), CellularGateway (an MG52), and SystemsManager — CampusGateway is
-present as a product type but has no devices deployed yet, so that folder
-comes back mostly empty.
