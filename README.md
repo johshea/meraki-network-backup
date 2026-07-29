@@ -28,7 +28,7 @@ python meraki_backup.py --org-id 1009754 --network-id L_625437398251084430
 # Change where backups land (default is ./meraki_backups)
 python meraki_backup.py --output-dir /path/to/backups
 
-# Also emit an Ansible-ready YAML inventory alongside the normal JSON backup:
+# Create an Ansible-ready YAML inventory alongside the normal JSON backup:
 python meraki_backup.py --network-name "Vision" --ansible
 
 If the network name matches more than one network across your organizations, the script lists every org/network pair it found and asks you to re-run with --org-name or --org-id to disambiguate — it won't guess.
