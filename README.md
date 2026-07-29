@@ -1,29 +1,17 @@
-# Meraki Network Backup
+Meraki Network Backup
 
-`meraki_backup.py` backs up hardware inventory and every network-level
-configuration setting for any Meraki network, using the official Cisco
-Meraki Dashboard API Python SDK. It is not tied to a specific organization
-or network — you tell it which network by name (or ID) each time you run it.
+meraki_backup.py backs up hardware inventory and every network-level configuration setting for any Meraki network, using the official Cisco Meraki Dashboard API Python SDK. It is not tied to a specific organization or network — you tell it which network by name (or ID) each time you run it.
 
-## Setup
-
-```bash
+Setup
+bash
 export MERAKI_API_KEY="your-meraki-api-key"
-```
 
-That's it — no `pip install` step needed. The script checks for the
-`meraki` package on startup and installs it automatically if it's missing
-(falling back through a normal install, `--break-system-packages`, and
-`--user` installs, in that order, to handle whatever kind of Python
-environment it's run in).
+That's it — no pip install step needed. The script checks for the meraki package on startup and installs it automatically if it's missing (falling back through a normal install, --break-system-packages, and --user installs, in that order, to handle whatever kind of Python environment it's run in).
 
-Get an API key from Meraki Dashboard: **Organization > Settings > Dashboard
-API access** (must be enabled for the org), then **My Profile > API access**
-to generate the key.
+Get an API key from Meraki Dashboard: Organization > Settings > Dashboard API access (must be enabled for the org), then My Profile > API access to generate the key.
 
-## Running it
-
-```bash
+Running it
+bash
 # No network specified -- you'll be prompted for a name interactively:
 python meraki_backup.py
 
@@ -39,19 +27,16 @@ python meraki_backup.py --org-id 1009754 --network-id L_625437398251084430
 
 # Change where backups land (default is ./meraki_backups)
 python meraki_backup.py --output-dir /path/to/backups
-```
 
-If the network name matches more than one network across your organizations,
-the script lists every org/network pair it found and asks you to re-run with
-`--org-name` or `--org-id` to disambiguate — it won't guess.
+# Also emit an Ansible-ready YAML inventory alongside the normal JSON backup:
+python meraki_backup.py --network-name "Vision" --ansible
 
-## Output structure
+If the network name matches more than one network across your organizations, the script lists every org/network pair it found and asks you to re-run with --org-name or --org-id to disambiguate — it won't guess.
 
-Each run creates a fresh timestamped folder so nothing gets overwritten, laid
-out to mirror the network's own structure — one top-level folder per Meraki
-product type actually present on that network:
+Output structure
 
-```
+Each run creates a fresh timestamped folder so nothing gets overwritten, laid out to mirror the network's own structure — one top-level folder per Meraki product type actually present on that network:
+
 meraki_backups/
   <NetworkName>_20260728T140512Z/
     manifest.json          <- summary: counts, sections run, error count
@@ -94,28 +79,38 @@ meraki_backups/
       devices_seen.json, clusters.json, organization_clusters_all.json
     SystemsManager/          (only if the network has SM enrolled)
       profiles.json, target_groups.json, devices.json
-```
+    Ansible/                 (only if run with --ansible)
+      inventory.yml, group_vars/*.yml, host_vars/*.yml
 
-Every top-level product folder is only created if that product type is
-actually present on the network being backed up — pointing the script at a
-switch-only network, for example, produces just `Organization/`, `Network/`,
-`Devices/`, and `Switch/`.
+Every top-level product folder is only created if that product type is actually present on the network being backed up — pointing the script at a switch-only network, for example, produces just Organization/, Network/, Devices/, and Switch/.
 
-## Notes
+Ansible YAML output (--ansible)
 
-- **Nothing here is destructive.** The script only reads (`get*` calls); it
-  never modifies the Meraki configuration.
-- **Resilient by design.** Every API call is wrapped individually — a
-  feature that isn't configured (no site-to-site VPN, VLANs not enabled,
-  etc.) is logged to `errors.json` instead of crashing the run.
-- **Campus Gateway** is Meraki's newest product line and its API is
-  org-scoped rather than per-network, so that folder pulls clusters at the
-  org level and filters down to the network being backed up.
-- **Systems Manager** backup captures profiles/settings/device list, not a
-  full MDM data dump (installed apps, security posture, etc.) — that data is
-  considerably larger and more sensitive, and generally isn't "network
-  configuration" in the same sense as the rest of this backup.
-- Rerun any time to get a fresh snapshot; keep old timestamped folders
-  around (or move them into whatever backup/versioning system you already
-  use) for history.
+Pass --ansible (or set MERAKI_BACKUP_ANSIBLE=1) to also build a standard Ansible inventory tree from the same data, inside an Ansible/ folder next to the JSON output:
 
+Ansible/
+  inventory.yml              <- groups: security_appliance, switch, wireless,
+                                 camera, sensor, cellular_gateway,
+                                 campus_gateway -- each with its hosts
+  group_vars/
+    all.yml                  <- org + network-wide settings (admins, licenses,
+                                 SNMP, alerts, group policies, etc.)
+    security_appliance.yml   <- VLANs, firewall rules, VPN, traffic shaping, ...
+    switch.yml               <- STP, QoS, ACLs, access policies, ...
+    wireless.yml             <- wireless settings, RF profiles, SSIDs, ...
+    sensor.yml, cellular_gateway.yml, campus_gateway.yml, systems_manager.yml
+  host_vars/
+    <device-name>_<serial>.yml   <- per-device config (ports, radio settings,
+                                     uplinks, etc.) plus meraki_serial,
+                                     meraki_model, meraki_mac, meraki_firmware
+
+inventory.yml sets ansible_host to each device's LAN IP when Meraki reports one (typically switches and appliances); devices without a directly reachable management IP (most APs, cameras, sensors) are still grouped and get full host_vars, just without ansible_host — set it yourself or drive those through a Meraki-aware Ansible collection/module keyed on meraki_serial instead of a direct connection.
+
+PyYAML is installed automatically (same auto-install mechanism as the meraki package) the first time you run with --ansible.
+
+Notes
+Nothing here is destructive. The script only reads (get* calls); it never modifies the Meraki configuration.
+Resilient by design. Every API call is wrapped individually — a feature that isn't configured (no site-to-site VPN, VLANs not enabled, etc.) is logged to errors.json instead of crashing the run.
+Campus Gateway is Meraki's newest product line and its API is org-scoped rather than per-network, so that folder pulls clusters at the org level and filters down to the network being backed up.
+Systems Manager backup captures profiles/settings/device list, not a full MDM data dump (installed apps, security posture, etc.) — that data is considerably larger and more sensitive, and generally isn't "network configuration" in the same sense as the rest of this backup.
+Rerun any time to get a fresh snapshot; keep old timestamped folders around (or move them into whatever backup/versioning system you already use) for history.
