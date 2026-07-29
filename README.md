@@ -15,8 +15,7 @@ bash
 # No network specified -- you'll be prompted for a name interactively:
 python meraki_backup.py
 
-# Resolve a network by name. If you don't say which org, it searches every
-# org this API key can see and uses the network if the name is unique:
+# Resolve a network by name. If you don't say which org, it searches every org this API key can see and uses the network if the name is unique:
 python meraki_backup.py --network-name "Vision"
 
 # Narrow to a specific org if the network name isn't unique across orgs:
