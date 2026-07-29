@@ -14,9 +14,9 @@ CampusGateway, SystemsManager), plus Organization/ and Network/ folders
 for org- and network-wide settings, and a Devices/ folder with the full
 hardware inventory.
 
-Dependencies (the 'meraki' package) are installed automatically the first
-time you run this script if they aren't already present -- no manual
-`pip install` step required.
+Dependencies (the 'meraki' package, and 'PyYAML' if you use --ansible) are
+installed automatically the first time you run this script if they aren't
+already present -- no manual `pip install` step required.
 
 Usage:
     export MERAKI_API_KEY="your-api-key"
@@ -34,6 +34,10 @@ Usage:
 
     python meraki_backup.py --output-dir /path/to/backups
 
+    # Also emit an Ansible-ready YAML inventory (group_vars/host_vars) built
+    # from the same data, alongside the normal JSON backup:
+    python meraki_backup.py --network-name "Vision" --ansible
+
 Every API call is wrapped so a single unsupported/disabled feature (e.g. no
 VPN configured, VLANs not enabled, etc.) can't abort the run -- failures are
 recorded in errors.json inside the backup folder instead.
@@ -42,30 +46,39 @@ recorded in errors.json inside the backup folder instead.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def _ensure_dependencies_installed():
-    """Install any missing required packages before we try to import them."""
-    required = ["meraki"]
-    missing = []
-    for pkg in required:
-        try:
-            __import__(pkg)
-        except ImportError:
-            missing.append(pkg)
+# (import_name, pip_package_name) -- names differ for PyYAML.
+BASE_REQUIRED_PACKAGES = [("meraki", "meraki")]
+ANSIBLE_REQUIRED_PACKAGES = [("yaml", "PyYAML")]
 
-    if not missing:
+
+def _ensure_dependencies_installed(want_ansible=False):
+    """Install any missing required packages before we try to import them."""
+    packages = list(BASE_REQUIRED_PACKAGES)
+    if want_ansible:
+        packages += ANSIBLE_REQUIRED_PACKAGES
+
+    missing_pip_names = []
+    for import_name, pip_name in packages:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing_pip_names.append(pip_name)
+
+    if not missing_pip_names:
         return
 
-    print(f"Installing missing dependencies: {', '.join(missing)} ...")
+    print(f"Installing missing dependencies: {', '.join(missing_pip_names)} ...")
     install_attempts = [
-        [sys.executable, "-m", "pip", "install", "--quiet", *missing],
-        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", *missing],
-        [sys.executable, "-m", "pip", "install", "--quiet", "--user", *missing],
+        [sys.executable, "-m", "pip", "install", "--quiet", *missing_pip_names],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", *missing_pip_names],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--user", *missing_pip_names],
     ]
     last_result = None
     for cmd in install_attempts:
@@ -76,15 +89,24 @@ def _ensure_dependencies_installed():
     else:
         sys.exit(
             "Could not automatically install required package(s): "
-            f"{', '.join(missing)}\n"
-            f"Install manually with: pip install {' '.join(missing)}\n\n"
+            f"{', '.join(missing_pip_names)}\n"
+            f"Install manually with: pip install {' '.join(missing_pip_names)}\n\n"
             f"Last error:\n{last_result.stderr if last_result else ''}"
         )
 
 
-_ensure_dependencies_installed()
+# --ansible may be anywhere in argv; check argv/env directly since this runs
+# before argparse (installing it up-front here keeps all dependency
+# installation in one place, at start-up, before any imports are needed).
+_want_ansible_at_startup = "--ansible" in sys.argv or os.environ.get("MERAKI_BACKUP_ANSIBLE", "").lower() in ("1", "true", "yes")
+_ensure_dependencies_installed(want_ansible=_want_ansible_at_startup)
 
 import meraki  # noqa: E402  (import deferred until after auto-install above)
+
+try:
+    import yaml  # noqa: E402
+except ImportError:
+    yaml = None  # only required if --ansible is used
 
 DEFAULT_OUTPUT_ROOT = "./meraki_backups"
 
@@ -140,6 +162,27 @@ def save_json(base_dir, relative_path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
     return path
+
+
+def save_yaml(base_dir, relative_path, data):
+    path = Path(base_dir) / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(
+            json.loads(json.dumps(data, default=str)),  # normalize non-YAML-native types first
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        )
+    return path
+
+
+def device_host_id(device):
+    """Stable Ansible inventory hostname for a device: <sanitized-name>_<serial>."""
+    serial = device["serial"]
+    name = safe_filename(device.get("name"), serial)
+    return f"{name}_{serial}"
 
 
 def safe_call(errors, label, func, *args, **kwargs):
@@ -263,16 +306,21 @@ def resolve_organization_and_network(dashboard, args):
 
 def backup_organization(dashboard, org, base_dir, errors):
     folder = "Organization"
+    collected = {"organization": org}
     save_json(base_dir, f"{folder}/organization.json", org)
     admins = safe_call(errors, "getOrganizationAdmins", dashboard.organizations.getOrganizationAdmins, org["id"])
     if admins is not None:
         save_json(base_dir, f"{folder}/admins.json", admins)
+        collected["admins"] = admins
     licenses = safe_call(errors, "getOrganizationLicensesOverview", dashboard.organizations.getOrganizationLicensesOverview, org["id"])
     if licenses is not None:
         save_json(base_dir, f"{folder}/licenses_overview.json", licenses)
+        collected["licenses_overview"] = licenses
     snmp = safe_call(errors, "getOrganizationSnmp", dashboard.organizations.getOrganizationSnmp, org["id"])
     if snmp is not None:
         save_json(base_dir, f"{folder}/snmp.json", snmp)
+        collected["snmp"] = snmp
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +329,7 @@ def backup_organization(dashboard, org, base_dir, errors):
 
 def backup_network_general(dashboard, network_id, base_dir, errors):
     folder = "Network"
+    collected = {}
     calls = [
         ("network_info", dashboard.networks.getNetwork, (network_id,), {}),
         ("settings", dashboard.networks.getNetworkSettings, (network_id,), {}),
@@ -300,6 +349,8 @@ def backup_network_general(dashboard, network_id, base_dir, errors):
         result = safe_call(errors, f"networks.{func.__name__}", func, *args, **kwargs)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected[name] = result
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -337,6 +388,7 @@ def backup_devices_inventory(dashboard, network_id, base_dir, errors):
 
 def backup_security_appliance(dashboard, network_id, devices, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["appliance"]
+    collected = {"network": {}, "devices": {}}
     network_calls = [
         ("settings", dashboard.appliance.getNetworkApplianceSettings),
         ("vlans_settings", dashboard.appliance.getNetworkApplianceVlansSettings),
@@ -367,12 +419,14 @@ def backup_security_appliance(dashboard, network_id, devices, base_dir, errors):
         result = safe_call(errors, f"appliance.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected["network"][name] = result
 
     appliance_devices = [d for d in devices if classify_device(d.get("model")) == "appliance"]
     for device in appliance_devices:
         serial = device["serial"]
         name = safe_filename(device.get("name"), serial)
         device_dir = f"{folder}/Devices/{name}_{serial}"
+        device_data = {}
         per_device_calls = [
             ("uplinks_settings", dashboard.appliance.getDeviceApplianceUplinksSettings),
             ("dhcp_subnets", dashboard.appliance.getDeviceApplianceDhcpSubnets),
@@ -382,6 +436,9 @@ def backup_security_appliance(dashboard, network_id, devices, base_dir, errors):
             result = safe_call(errors, f"appliance.{func.__name__}({serial})", func, serial)
             if result is not None:
                 save_json(base_dir, f"{device_dir}/{out_name}.json", result)
+                device_data[out_name] = result
+        collected["devices"][serial] = device_data
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -390,6 +447,7 @@ def backup_security_appliance(dashboard, network_id, devices, base_dir, errors):
 
 def backup_switch(dashboard, network_id, devices, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["switch"]
+    collected = {"network": {}, "devices": {}}
     network_calls = [
         ("settings", dashboard.switch.getNetworkSwitchSettings),
         ("stp", dashboard.switch.getNetworkSwitchStp),
@@ -411,23 +469,30 @@ def backup_switch(dashboard, network_id, devices, base_dir, errors):
         result = safe_call(errors, f"switch.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected["network"][name] = result
 
     switch_devices = [d for d in devices if classify_device(d.get("model")) == "switch"]
     for device in switch_devices:
         serial = device["serial"]
         name = safe_filename(device.get("name"), serial)
         device_dir = f"{folder}/Devices/{name}_{serial}"
+        device_data = {}
         ports = safe_call(errors, f"getDeviceSwitchPorts({serial})", dashboard.switch.getDeviceSwitchPorts, serial)
         if ports is not None:
             save_json(base_dir, f"{device_dir}/ports.json", ports)
+            device_data["ports"] = ports
         routing_interfaces = safe_call(
             errors, f"getDeviceSwitchRoutingInterfaces({serial})", dashboard.switch.getDeviceSwitchRoutingInterfaces, serial
         )
         if routing_interfaces is not None:
             save_json(base_dir, f"{device_dir}/routing_interfaces.json", routing_interfaces)
+            device_data["routing_interfaces"] = routing_interfaces
         warm_spare = safe_call(errors, f"getDeviceSwitchWarmSpare({serial})", dashboard.switch.getDeviceSwitchWarmSpare, serial)
         if warm_spare is not None:
             save_json(base_dir, f"{device_dir}/warm_spare.json", warm_spare)
+            device_data["warm_spare"] = warm_spare
+        collected["devices"][serial] = device_data
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -436,6 +501,7 @@ def backup_switch(dashboard, network_id, devices, base_dir, errors):
 
 def backup_wireless(dashboard, network_id, devices, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["wireless"]
+    collected = {"network": {}, "ssids": {}, "devices": {}}
     network_calls = [
         ("settings", dashboard.wireless.getNetworkWirelessSettings),
         ("rf_profiles", dashboard.wireless.getNetworkWirelessRfProfiles),
@@ -447,16 +513,19 @@ def backup_wireless(dashboard, network_id, devices, base_dir, errors):
         result = safe_call(errors, f"wireless.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected["network"][name] = result
 
     ssids = safe_call(errors, "getNetworkWirelessSsids", dashboard.wireless.getNetworkWirelessSsids, network_id)
     if ssids is not None:
         save_json(base_dir, f"{folder}/ssids.json", ssids)
+        collected["network"]["ssids"] = ssids
         for ssid in ssids:
             number = ssid.get("number")
             if number is None or not ssid.get("enabled", True):
                 continue
             ssid_name = safe_filename(ssid.get("name"), f"ssid_{number}")
             ssid_dir = f"{folder}/Ssids/{number}_{ssid_name}"
+            ssid_data = {}
             per_ssid_calls = [
                 ("firewall_l3_rules", dashboard.wireless.getNetworkWirelessSsidFirewallL3FirewallRules),
                 ("firewall_l7_rules", dashboard.wireless.getNetworkWirelessSsidFirewallL7FirewallRules),
@@ -467,18 +536,25 @@ def backup_wireless(dashboard, network_id, devices, base_dir, errors):
                 result = safe_call(errors, f"wireless.{func.__name__}(#{number})", func, network_id, number)
                 if result is not None:
                     save_json(base_dir, f"{ssid_dir}/{out_name}.json", result)
+                    ssid_data[out_name] = result
+            collected["ssids"][f"{number}_{ssid_name}"] = {"ssid": ssid, **ssid_data}
 
     wireless_devices = [d for d in devices if classify_device(d.get("model")) == "wireless"]
     for device in wireless_devices:
         serial = device["serial"]
         name = safe_filename(device.get("name"), serial)
         device_dir = f"{folder}/Devices/{name}_{serial}"
+        device_data = {}
         radio = safe_call(errors, f"getDeviceWirelessRadioSettings({serial})", dashboard.wireless.getDeviceWirelessRadioSettings, serial)
         if radio is not None:
             save_json(base_dir, f"{device_dir}/radio_settings.json", radio)
+            device_data["radio_settings"] = radio
         bt = safe_call(errors, f"getDeviceWirelessBluetoothSettings({serial})", dashboard.wireless.getDeviceWirelessBluetoothSettings, serial)
         if bt is not None:
             save_json(base_dir, f"{device_dir}/bluetooth_settings.json", bt)
+            device_data["bluetooth_settings"] = bt
+        collected["devices"][serial] = device_data
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -487,6 +563,7 @@ def backup_wireless(dashboard, network_id, devices, base_dir, errors):
 
 def backup_camera(dashboard, network_id, devices, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["camera"]
+    collected = {"network": {}, "devices": {}}
     network_calls = [
         ("quality_retention_profiles", dashboard.camera.getNetworkCameraQualityRetentionProfiles),
         ("wireless_profiles", dashboard.camera.getNetworkCameraWirelessProfiles),
@@ -496,12 +573,14 @@ def backup_camera(dashboard, network_id, devices, base_dir, errors):
         result = safe_call(errors, f"camera.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected["network"][name] = result
 
     camera_devices = [d for d in devices if classify_device(d.get("model")) == "camera"]
     for device in camera_devices:
         serial = device["serial"]
         name = safe_filename(device.get("name"), serial)
         device_dir = f"{folder}/Devices/{name}_{serial}"
+        device_data = {}
         per_device_calls = [
             ("quality_and_retention", dashboard.camera.getDeviceCameraQualityAndRetention),
             ("sense_settings", dashboard.camera.getDeviceCameraSense),
@@ -512,6 +591,9 @@ def backup_camera(dashboard, network_id, devices, base_dir, errors):
             result = safe_call(errors, f"camera.{func.__name__}({serial})", func, serial)
             if result is not None:
                 save_json(base_dir, f"{device_dir}/{out_name}.json", result)
+                device_data[out_name] = result
+        collected["devices"][serial] = device_data
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -520,6 +602,7 @@ def backup_camera(dashboard, network_id, devices, base_dir, errors):
 
 def backup_sensor(dashboard, network_id, devices, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["sensor"]
+    collected = {"network": {}, "devices": {}}
     network_calls = [
         ("alerts_profiles", dashboard.sensor.getNetworkSensorAlertsProfiles),
         ("mqtt_brokers", dashboard.sensor.getNetworkSensorMqttBrokers),
@@ -529,6 +612,7 @@ def backup_sensor(dashboard, network_id, devices, base_dir, errors):
         result = safe_call(errors, f"sensor.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected["network"][name] = result
 
     sensor_devices = [d for d in devices if classify_device(d.get("model")) == "sensor"]
     for device in sensor_devices:
@@ -536,8 +620,12 @@ def backup_sensor(dashboard, network_id, devices, base_dir, errors):
         name = safe_filename(device.get("name"), serial)
         device_dir = f"{folder}/Devices/{name}_{serial}"
         rel = safe_call(errors, f"getDeviceSensorRelationships({serial})", dashboard.sensor.getDeviceSensorRelationships, serial)
+        device_data = {}
         if rel is not None:
             save_json(base_dir, f"{device_dir}/relationships.json", rel)
+            device_data["relationships"] = rel
+        collected["devices"][serial] = device_data
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -546,6 +634,7 @@ def backup_sensor(dashboard, network_id, devices, base_dir, errors):
 
 def backup_cellular_gateway(dashboard, network_id, devices, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["cellularGateway"]
+    collected = {"network": {}, "devices": {}}
     network_calls = [
         ("subnet_pool", dashboard.cellularGateway.getNetworkCellularGatewaySubnetPool),
         ("uplink", dashboard.cellularGateway.getNetworkCellularGatewayUplink),
@@ -556,21 +645,27 @@ def backup_cellular_gateway(dashboard, network_id, devices, base_dir, errors):
         result = safe_call(errors, f"cellularGateway.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected["network"][name] = result
 
     mg_devices = [d for d in devices if classify_device(d.get("model")) == "cellularGateway"]
     for device in mg_devices:
         serial = device["serial"]
         name = safe_filename(device.get("name"), serial)
         device_dir = f"{folder}/Devices/{name}_{serial}"
+        device_data = {}
         lan = safe_call(errors, f"getDeviceCellularGatewayLan({serial})", dashboard.cellularGateway.getDeviceCellularGatewayLan, serial)
         if lan is not None:
             save_json(base_dir, f"{device_dir}/lan.json", lan)
+            device_data["lan"] = lan
         pf = safe_call(
             errors, f"getDeviceCellularGatewayPortForwardingRules({serial})",
             dashboard.cellularGateway.getDeviceCellularGatewayPortForwardingRules, serial
         )
         if pf is not None:
             save_json(base_dir, f"{device_dir}/port_forwarding_rules.json", pf)
+            device_data["port_forwarding_rules"] = pf
+        collected["devices"][serial] = device_data
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -582,6 +677,7 @@ def backup_campus_gateway(dashboard, org_id, network_id, devices, base_dir, erro
     (clusters live at the org level and reference a networkId), rather than
     having per-network endpoints like the older product lines."""
     folder = PRODUCT_FOLDER_NAMES["campusGateway"]
+    collected = {"network": {}, "devices": {}}
     cg_devices = [d for d in devices if classify_device(d.get("model")) == "campusGateway"]
     save_json(base_dir, f"{folder}/devices_seen.json", cg_devices)
 
@@ -594,7 +690,7 @@ def backup_campus_gateway(dashboard, org_id, network_id, devices, base_dir, erro
                 "Update the meraki package (pip install -U meraki) to back this up."
             ),
         })
-        return
+        return collected
 
     clusters = safe_call(
         errors, "campusGateway.getOrganizationCampusGatewayClusters",
@@ -606,6 +702,7 @@ def backup_campus_gateway(dashboard, org_id, network_id, devices, base_dir, erro
         save_json(base_dir, f"{folder}/organization_clusters_all.json", clusters)
         this_network = [c for c in clusters if c.get("networkId") == network_id]
         save_json(base_dir, f"{folder}/clusters.json", this_network)
+        collected["network"]["clusters"] = this_network
 
     serials = [d["serial"] for d in cg_devices]
     if serials:
@@ -616,6 +713,8 @@ def backup_campus_gateway(dashboard, org_id, network_id, devices, base_dir, erro
         )
         if overrides is not None:
             save_json(base_dir, f"{folder}/devices_uplinks_local_overrides.json", overrides)
+            collected["network"]["devices_uplinks_local_overrides"] = overrides
+    return collected
 
 
 # --------------------------------------------------------------------------
@@ -624,6 +723,7 @@ def backup_campus_gateway(dashboard, org_id, network_id, devices, base_dir, erro
 
 def backup_systems_manager(dashboard, network_id, base_dir, errors):
     folder = PRODUCT_FOLDER_NAMES["systemsManager"]
+    collected = {}
     network_calls = [
         ("profiles", dashboard.sm.getNetworkSmProfiles),
         ("target_groups", dashboard.sm.getNetworkSmTargetGroups),
@@ -633,6 +733,147 @@ def backup_systems_manager(dashboard, network_id, base_dir, errors):
         result = safe_call(errors, f"sm.{func.__name__}", func, network_id)
         if result is not None:
             save_json(base_dir, f"{folder}/{name}.json", result)
+            collected[name] = result
+    return collected
+
+
+# --------------------------------------------------------------------------
+# Ansible YAML output -- built from the same data collected above, laid out
+# as a standard Ansible inventory + group_vars/ + host_vars/ tree so a
+# playbook can `ansible-inventory -i Ansible/inventory.yml` this directly,
+# or point --extra-vars/vars_files at the group_vars/host_vars files.
+# --------------------------------------------------------------------------
+
+# Maps our internal product-type keys to Ansible-friendly group names.
+ANSIBLE_GROUP_NAMES = {
+    "appliance": "security_appliance",
+    "switch": "switch",
+    "wireless": "wireless",
+    "camera": "camera",
+    "sensor": "sensor",
+    "cellularGateway": "cellular_gateway",
+    "campusGateway": "campus_gateway",
+}
+
+
+def _device_ansible_host_vars(device):
+    """Common vars every device gets in the inventory, regardless of type."""
+    tags = device.get("tags")
+    if isinstance(tags, str):
+        tags = [t for t in tags.split(" ") if t]
+    host_vars = {
+        "meraki_serial": device.get("serial"),
+        "meraki_model": device.get("model"),
+        "meraki_mac": device.get("mac"),
+        "meraki_firmware": device.get("firmware"),
+        "meraki_network_id": device.get("networkId"),
+        "meraki_tags": tags or [],
+    }
+    lan_ip = device.get("lanIp")
+    if lan_ip:
+        host_vars["ansible_host"] = lan_ip
+        host_vars["meraki_lan_ip"] = lan_ip
+    return {k: v for k, v in host_vars.items() if v not in (None, "", [])}
+
+
+def build_ansible_output(base_dir, org, network, devices, category_data, errors,
+                          org_data=None, network_data=None):
+    """Write Ansible/inventory.yml, Ansible/group_vars/*.yml and
+    Ansible/host_vars/*.yml from the data already collected during backup.
+
+    category_data maps our internal product-type key (e.g. "appliance",
+    "switch", ...) to whatever that section's backup_* function returned:
+    {"network": {...}, "devices": {serial: {...}}} for per-device sections,
+    or a flat dict for network-only sections (systemsManager).
+    """
+    if yaml is None:
+        errors.append({
+            "call": "ansible_output",
+            "error": "PyYAML is not installed and could not be auto-installed; skipping --ansible output.",
+        })
+        return
+
+    ansible_root = "Ansible"
+    devices_by_serial = {d["serial"]: d for d in devices}
+    groups = {}  # group_name -> {hostname: host_vars}
+
+    # Org- and network-wide settings that aren't specific to any product
+    # type (admins, licenses, SNMP, alerts, group policies, etc.) -> a
+    # shared group_vars/all.yml every host in the inventory picks up.
+    all_vars_extra = {}
+    if org_data:
+        all_vars_extra["meraki_organization"] = org_data
+    if network_data:
+        all_vars_extra["meraki_network"] = network_data
+    if all_vars_extra:
+        save_yaml(base_dir, f"{ansible_root}/group_vars/all.yml", all_vars_extra)
+
+    for category, data in category_data.items():
+        group_name = ANSIBLE_GROUP_NAMES.get(category)
+        if not group_name or not data:
+            continue
+
+        # Network-wide settings for this product type -> group_vars/<group>.yml
+        network_data = dict(data.get("network", data if "devices" not in data else {}))
+        if category == "wireless" and data.get("ssids"):
+            network_data["ssids"] = data["ssids"]
+        if network_data:
+            save_yaml(
+                base_dir,
+                f"{ansible_root}/group_vars/{group_name}.yml",
+                {f"meraki_{group_name}_settings": network_data},
+            )
+
+        # Per-device data -> host_vars/<hostname>.yml, and register the host
+        # in its product-type group for inventory.yml.
+        for serial, device_data in data.get("devices", {}).items():
+            device = devices_by_serial.get(serial)
+            if device is None:
+                continue
+            hostname = device_host_id(device)
+            host_vars = _device_ansible_host_vars(device)
+            groups.setdefault(group_name, {})[hostname] = host_vars
+            save_yaml(
+                base_dir,
+                f"{ansible_root}/host_vars/{hostname}.yml",
+                {"meraki_device": device, **{f"meraki_{k}": v for k, v in device_data.items()}},
+            )
+
+    # Any device that didn't get picked up by a per-device section above
+    # (e.g. unclassified/unknown models) still gets a group + host_vars.
+    for device in devices:
+        category = classify_device(device.get("model"))
+        group_name = ANSIBLE_GROUP_NAMES.get(category, "unclassified")
+        hostname = device_host_id(device)
+        if hostname not in groups.get(group_name, {}):
+            groups.setdefault(group_name, {})[hostname] = _device_ansible_host_vars(device)
+            save_yaml(base_dir, f"{ansible_root}/host_vars/{hostname}.yml", {"meraki_device": device})
+
+    # systemsManager has no devices of its own (SM-enrolled endpoints aren't
+    # part of `devices`), so just drop its data straight into group_vars.
+    if "systemsManager" in category_data and category_data["systemsManager"]:
+        save_yaml(
+            base_dir,
+            f"{ansible_root}/group_vars/systems_manager.yml",
+            {"meraki_systems_manager_settings": category_data["systemsManager"]},
+        )
+
+    inventory = {
+        "all": {
+            "vars": {
+                "meraki_organization_id": org["id"],
+                "meraki_organization_name": org["name"],
+                "meraki_network_id": network["id"],
+                "meraki_network_name": network["name"],
+            },
+            "children": {
+                group_name: {"hosts": hosts}
+                for group_name, hosts in sorted(groups.items())
+                if hosts
+            },
+        }
+    }
+    save_yaml(base_dir, f"{ansible_root}/inventory.yml", inventory)
 
 
 # --------------------------------------------------------------------------
@@ -653,6 +894,10 @@ def parse_args():
                     help="Network name to resolve to an ID. Prompted for if omitted.")
     p.add_argument("--output-dir", default=os.environ.get("MERAKI_BACKUP_DIR", DEFAULT_OUTPUT_ROOT),
                     help="Where to write the timestamped backup folder (default: ./meraki_backups)")
+    p.add_argument("--ansible", action="store_true",
+                    default=os.environ.get("MERAKI_BACKUP_ANSIBLE", "").lower() in ("1", "true", "yes"),
+                    help="Also emit an Ansible-ready YAML inventory (Ansible/inventory.yml, "
+                         "group_vars/, host_vars/) built from the same backed-up data.")
     return p.parse_args()
 
 
@@ -684,37 +929,43 @@ def main():
     print(f"Backing up network '{network['name']}' ({network['id']}) in org '{org['name']}' ({org['id']})")
     print(f"Output directory: {base_dir}")
 
-    backup_organization(dashboard, org, base_dir, errors)
-    backup_network_general(dashboard, network["id"], base_dir, errors)
+    org_data = backup_organization(dashboard, org, base_dir, errors)
+    network_data = backup_network_general(dashboard, network["id"], base_dir, errors)
     devices = backup_devices_inventory(dashboard, network["id"], base_dir, errors)
 
     product_types = set(network.get("productTypes", []))
     ran = []
+    category_data = {}
 
     if "appliance" in product_types:
-        backup_security_appliance(dashboard, network["id"], devices, base_dir, errors)
+        category_data["appliance"] = backup_security_appliance(dashboard, network["id"], devices, base_dir, errors)
         ran.append("appliance")
     if "switch" in product_types:
-        backup_switch(dashboard, network["id"], devices, base_dir, errors)
+        category_data["switch"] = backup_switch(dashboard, network["id"], devices, base_dir, errors)
         ran.append("switch")
     if "wireless" in product_types:
-        backup_wireless(dashboard, network["id"], devices, base_dir, errors)
+        category_data["wireless"] = backup_wireless(dashboard, network["id"], devices, base_dir, errors)
         ran.append("wireless")
     if "camera" in product_types:
-        backup_camera(dashboard, network["id"], devices, base_dir, errors)
+        category_data["camera"] = backup_camera(dashboard, network["id"], devices, base_dir, errors)
         ran.append("camera")
     if "sensor" in product_types:
-        backup_sensor(dashboard, network["id"], devices, base_dir, errors)
+        category_data["sensor"] = backup_sensor(dashboard, network["id"], devices, base_dir, errors)
         ran.append("sensor")
     if "cellularGateway" in product_types:
-        backup_cellular_gateway(dashboard, network["id"], devices, base_dir, errors)
+        category_data["cellularGateway"] = backup_cellular_gateway(dashboard, network["id"], devices, base_dir, errors)
         ran.append("cellularGateway")
     if "campusGateway" in product_types:
-        backup_campus_gateway(dashboard, org["id"], network["id"], devices, base_dir, errors)
+        category_data["campusGateway"] = backup_campus_gateway(dashboard, org["id"], network["id"], devices, base_dir, errors)
         ran.append("campusGateway")
     if "systemsManager" in product_types:
-        backup_systems_manager(dashboard, network["id"], base_dir, errors)
+        category_data["systemsManager"] = backup_systems_manager(dashboard, network["id"], base_dir, errors)
         ran.append("systemsManager")
+
+    if args.ansible:
+        print("Building Ansible YAML inventory ...")
+        build_ansible_output(base_dir, org, network, devices, category_data, errors,
+                              org_data=org_data, network_data=network_data)
 
     device_counts = {}
     for d in devices:
@@ -729,11 +980,14 @@ def main():
         "device_count_total": len(devices),
         "device_counts_by_category": device_counts,
         "error_count": len(errors),
+        "ansible_output": bool(args.ansible),
     }
     save_json(base_dir, "manifest.json", manifest)
     save_json(base_dir, "errors.json", errors)
 
     print(f"\nDone. {len(devices)} devices backed up across {len(ran)} product sections.")
+    if args.ansible:
+        print(f"Ansible YAML inventory written to: {base_dir / 'Ansible'}")
     if errors:
         print(f"{len(errors)} calls failed or were unsupported -- see errors.json for details.")
     print(f"Backup written to: {base_dir}")
